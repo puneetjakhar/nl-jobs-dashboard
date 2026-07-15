@@ -619,24 +619,209 @@ function renderResume(raw, fromCache = false) {
     if ((r.keywords_already_present||[]).length) {
       html += `<div class="kw-section"><div class="kw-label">Already Present ✅</div><div class="kw-tags">${r.keywords_already_present.map(k=>`<span class="kw-tag kw-present">✓ ${esc(k)}</span>`).join('')}</div></div>`;
     }
+    if ((r.keyword_prominence||[]).length) {
+      window._keywordProminence = r.keyword_prominence;
+      html += `<div class="kw-section"><div class="kw-label">Prominent Keywords for This Role</div><div class="kw-tags" id="kw-prom-tags">`;
+      r.keyword_prominence.forEach(k => {
+        const p = (k.prominence||'').toLowerCase();
+        const bg = p==='high'?'#ef444422':p==='medium'?'#f59e0b22':'#64748b22';
+        const bd = p==='high'?'#ef4444':p==='medium'?'#f59e0b':'#64748b';
+        html += `<span class="kw-tag" style="background:${bg};border:1px solid ${bd}55;color:${bd}" data-kw="${esc((k.keyword||'').toLowerCase())}">${esc(k.keyword||'')}${k.count?` ·${k.count}`:''}</span>`;
+      });
+      html += `</div></div>`;
+    }
     if ((r.changes||[]).length) {
-      html += `<div class="changes-section"><div class="kw-label">Suggested Bullet Edits</div>`;
-      r.changes.forEach(c => {
+      window._resumeChanges = r.changes;
+      html += `<div class="changes-section"><div class="kw-label">Suggested Bullet Edits <span style="font-weight:400;color:var(--text-muted)">(untick to skip, edit text to customise)</span></div>`;
+      r.changes.forEach((c,i) => {
         html += `<div class="change-item">
-          <div class="change-section-label">📌 ${esc(c.section||'')}</div>
-          <div class="change-line change-remove">− ${esc(c.current||'')}</div>
-          <div class="change-line change-add">+ ${esc(c.suggested||'')}</div>
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" id="edit-accept-${i}" checked>
+            <span class="change-section-label">📌 ${esc(c.section||'')}</span>
+          </label>
+          <div class="change-line change-remove" style="margin-top:6px">− ${esc(c.current||'')}</div>
+          <textarea id="edit-text-${i}" class="edit-suggested" data-current="${esc(c.current||'')}" style="width:100%;margin-top:6px;min-height:52px;font-size:13px;line-height:1.6;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text)">${esc(c.suggested||'')}</textarea>
           <div class="change-why">${esc(c.why||'')}</div>
         </div>`;
       });
-      html += `</div>`;
+      html += `<div id="custom-edits"></div>
+        <button class="action-btn" onclick="addCustomEdit()" style="margin-top:8px">+ Add custom edit</button>
+      </div>`;
     }
+    // Reorder + generate area (populated after we fetch the resume structure from the helper)
+    html += `<div id="reorder-area" style="margin-top:18px"></div>
+      <div id="generate-area" style="margin-top:18px;border-top:1px solid var(--border);padding-top:16px">
+        <div id="helper-status" style="font-size:12px;color:var(--text-muted);margin-bottom:10px"></div>
+        <button class="action-btn" id="generate-btn" onclick="generateTailoredResume()" style="background:var(--accent);color:#fff;font-weight:700">📄 Generate tailored resume</button>
+        <div id="generate-result" style="margin-top:12px;font-size:13px"></div>
+      </div>`;
   } catch(e) {
     html = `<div style="white-space:pre-wrap;font-size:13px;line-height:1.8">${esc(raw)}</div>`;
   }
   html += `<div style="margin-top:16px;display:flex;align-items:center;gap:8px">${cacheLabel}<button class="action-btn" onclick="loadSection('resume',true)" style="margin-left:auto">↺ Refresh</button></div>`;
   document.getElementById('section-resume').innerHTML = html;
   setTabStatus('resume', 'done');
+  // Kick off helper health check + reorder UI (async, non-blocking)
+  if (window._recommendedResume) initGenerateUI(window._recommendedResume);
+}
+
+// ── Tailored resume generation (talks to local resume_server.py) ──────────────
+function helperBase() {
+  return (localStorage.getItem('resume_helper_url') || 'http://127.0.0.1:8765').replace(/\/$/, '');
+}
+
+let _customEditSeq = 0;
+function addCustomEdit() {
+  const box = document.getElementById('custom-edits');
+  if (!box) return;
+  const id = _customEditSeq++;
+  const row = document.createElement('div');
+  row.className = 'custom-edit';
+  row.style.cssText = 'margin-top:10px;padding:10px;border:1px dashed var(--border);border-radius:8px';
+  row.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">Exact current bullet text to find</div>
+    <textarea class="ce-find" style="width:100%;min-height:42px;font-size:12px;padding:6px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text)"></textarea>
+    <div style="font-size:11px;color:var(--text-muted);margin:6px 0 4px">Replace with</div>
+    <textarea class="ce-replace" style="width:100%;min-height:42px;font-size:12px;padding:6px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text)"></textarea>
+    <button class="action-btn" onclick="this.parentNode.remove()" style="margin-top:6px">Remove</button>`;
+  box.appendChild(row);
+}
+
+async function initGenerateUI(variant) {
+  const statusEl = document.getElementById('helper-status');
+  const genBtn = document.getElementById('generate-btn');
+  try {
+    const h = await fetch(helperBase() + '/health', {method:'GET'});
+    if (!h.ok) throw new Error('bad health');
+    statusEl.innerHTML = `✅ Resume helper connected (<code>${helperBase()}</code>)`;
+    if (genBtn) genBtn.disabled = false;
+    await loadReorderUI(variant);
+  } catch(e) {
+    if (genBtn) genBtn.disabled = true;
+    statusEl.innerHTML = `⚠️ Resume helper not running. Start it to generate files:<br><code>python3 resume_server.py</code> in the project folder, then click ↺ Refresh.`;
+  }
+}
+
+async function loadReorderUI(variant) {
+  const area = document.getElementById('reorder-area');
+  try {
+    const resp = await fetch(helperBase() + '/resume-structure?variant=' + encodeURIComponent(variant));
+    const data = await resp.json();
+    if (!data.ok) { area.innerHTML = ''; return; }
+    window._reorderState = { skills: (data.skills||[]).map(s => ({...s, tokens:[...(s.tokens||[])]})),
+                             roles: (data.roles||[]).map(r => ({...r, bullets:[...(r.bullets||[])]})) };
+    renderReorderState();
+  } catch(e) { area.innerHTML = ''; }
+}
+
+function _promSet() {
+  return new Set((window._keywordProminence||[]).map(k => (k.keyword||'').toLowerCase()));
+}
+function _isProminent(text) {
+  const t = (text||'').toLowerCase();
+  for (const kw of _promSet()) { if (kw && t.includes(kw)) return true; }
+  return false;
+}
+
+function renderReorderState() {
+  const st = window._reorderState; if (!st) return;
+  let h = `<div class="kw-label">Reorder to surface prominent keywords <span style="font-weight:400;color:var(--text-muted)">(★ = contains a prominent keyword)</span></div>`;
+  // Skills / Technologies lines: reorder tokens within each line
+  (st.skills||[]).forEach((s, si) => {
+    h += `<div style="margin:10px 0;padding:10px;border:1px solid var(--border);border-radius:8px">
+      <div style="font-size:12px;font-weight:700;margin-bottom:6px">${esc(s.label||'')}${s.role?` <span style="font-weight:400;color:var(--text-muted)">(${esc(s.role.split('|')[0].trim())})</span>`:''}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">`;
+    (s.tokens||[]).forEach((tok, ti) => {
+      const star = _isProminent(tok) ? '★ ' : '';
+      const strong = _isProminent(tok);
+      h += `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 6px;border-radius:6px;font-size:12px;border:1px solid ${strong?'#ef4444':'var(--border)'};background:${strong?'#ef444415':'var(--bg)'}">
+        <span style="cursor:pointer" onclick="moveToken(${si},${ti},-1)">◀</span>${star}${esc(tok)}<span style="cursor:pointer" onclick="moveToken(${si},${ti},1)">▶</span></span>`;
+    });
+    h += `</div></div>`;
+  });
+  // Role bullets: reorder whole bullets
+  (st.roles||[]).forEach((r, ri) => {
+    if (!(r.bullets||[]).length) return;
+    h += `<div style="margin:10px 0;padding:10px;border:1px solid var(--border);border-radius:8px">
+      <div style="font-size:12px;font-weight:700;margin-bottom:6px">${esc(r.header.split('|')[0].trim())} — bullets</div>`;
+    (r.bullets||[]).forEach((b, bi) => {
+      const star = _isProminent(b) ? '★ ' : '';
+      h += `<div style="display:flex;align-items:flex-start;gap:6px;margin:4px 0;font-size:12px">
+        <span style="cursor:pointer" onclick="moveBullet(${ri},${bi},-1)">▲</span>
+        <span style="cursor:pointer" onclick="moveBullet(${ri},${bi},1)">▼</span>
+        <span>${star}${esc(b.length>90?b.slice(0,90)+'…':b)}</span></div>`;
+    });
+    h += `</div>`;
+  });
+  document.getElementById('reorder-area').innerHTML = h;
+}
+
+function _swap(arr, i, j) { if (j<0||j>=arr.length) return; const t=arr[i]; arr[i]=arr[j]; arr[j]=t; }
+function moveToken(si, ti, dir) { _swap(window._reorderState.skills[si].tokens, ti, ti+dir); renderReorderState(); }
+function moveBullet(ri, bi, dir) { _swap(window._reorderState.roles[ri].bullets, bi, bi+dir); renderReorderState(); }
+
+function collectPayload() {
+  const edits = [];
+  // Accepted suggested edits (with any user customisation)
+  (window._resumeChanges||[]).forEach((c,i) => {
+    const cb = document.getElementById('edit-accept-'+i);
+    const ta = document.getElementById('edit-text-'+i);
+    if (cb && cb.checked && ta && ta.value.trim()) {
+      edits.push({ find: ta.dataset.current || c.current, replace: ta.value.trim() });
+    }
+  });
+  // Custom edits
+  document.querySelectorAll('#custom-edits .custom-edit').forEach(row => {
+    const f = row.querySelector('.ce-find').value.trim();
+    const r = row.querySelector('.ce-replace').value.trim();
+    if (f && r) edits.push({ find: f, replace: r });
+  });
+  const reorders = [];
+  const st = window._reorderState;
+  if (st) {
+    // Token reorders become edits on the skills/technologies line (label preserved)
+    (st.skills||[]).forEach(s => {
+      const orig = (s.text||'');
+      const rebuilt = (s.label||'') + ': ' + (s.tokens||[]).join(', ');
+      if (rebuilt !== orig) edits.push({ find: orig, replace: rebuilt });
+    });
+    // Bullet reorders become paragraph moves
+    (st.roles||[]).forEach(r => {
+      reorders.push({ scope: 'bullets', anchor: r.header, order: r.bullets });
+    });
+  }
+  return {
+    variant: window._recommendedResume || 'Resume_Backend',
+    company: (window._job && window._job.company) || 'Job',
+    edits, reorders,
+  };
+}
+
+async function generateTailoredResume() {
+  const out = document.getElementById('generate-result');
+  const btn = document.getElementById('generate-btn');
+  const payload = collectPayload();
+  out.innerHTML = '<div class="loading-block" style="padding:12px"><div class="spinner"></div><div>Generating…</div></div>';
+  if (btn) btn.disabled = true;
+  try {
+    const resp = await fetch(helperBase() + '/tailor-resume', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (!data.ok) { out.innerHTML = `<div style="color:var(--red)">❌ ${esc(data.message||'Failed')}</div>`; return; }
+    let h = `<div style="color:var(--green);font-weight:700">✅ ${esc(data.message||'Generated')}</div>`;
+    h += `<div style="margin-top:6px;color:var(--text-muted)">📄 ${esc(data.docx_path||'')}</div>`;
+    if (data.pdf_path) h += `<div style="color:var(--text-muted)">📕 ${esc(data.pdf_path)}${data.pages?` · ${data.pages} page(s)`:''}</div>`;
+    if ((data.unmatched||[]).length) {
+      h += `<div style="margin-top:8px;color:var(--yellow)">⚠️ Could not locate ${data.unmatched.length} edit(s):</div><ul style="margin:4px 0 0 18px;color:var(--text-muted);font-size:12px">`;
+      data.unmatched.forEach(u => { h += `<li>${esc(u.length>80?u.slice(0,80)+'…':u)}</li>`; });
+      h += `</ul>`;
+    }
+    out.innerHTML = h;
+  } catch(e) {
+    out.innerHTML = `<div style="color:var(--red)">❌ Could not reach the resume helper. Is <code>resume_server.py</code> running?</div>`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 // Parse Q&A text into structured items
@@ -1174,7 +1359,7 @@ async function loadSection(section, force = false) {
       document.getElementById('section-resume').innerHTML = '<div class="loading-block"><div class="spinner"></div><div>Analysing resume fit...</div></div>';
       const text = await callClaude(
         'You are a resume expert. Never use em-dashes (—) in any text. Respond only with valid JSON.',
-        `Analyse this job for Puneet Kumar and recommend which resume to use + specific edits.\n\nJOB:\n${jobCtx}\n\nCANDIDATE:\n${profile}\n\nRespond with JSON only (no markdown):\n{"recommended_resume":"Resume_Backend","reason":"one sentence why","changes":[{"section":"which bullet","current":"original text","suggested":"improved text","why":"reason"}],"keywords_to_add":["kw1","kw2","kw3"],"keywords_already_present":["kw1","kw2"]}\nrecommended_resume must be exactly one of: Resume_Backend OR Resume_Platform OR Resume_Java OR Resume_AI OR Resume_CSharp OR Resume_General. Choose based on: Resume_Backend for distributed systems/backend roles; Resume_Platform for platform/infra/DevOps roles; Resume_Java for Java/Spring-focused roles; Resume_AI for AI/ML/LLM roles; Resume_CSharp for C#/.Net/Azure roles; Resume_General for broad/mixed/full-stack roles that span AI, backend, and Java. Max 3 changes. Max 5 keywords each.`
+        `Analyse this job for Puneet Kumar and recommend which resume to use + specific edits.\n\nJOB:\n${jobCtx}\n\nCANDIDATE:\n${profile}\n\nRespond with JSON only (no markdown):\n{"recommended_resume":"Resume_Backend","reason":"one sentence why","changes":[{"section":"which bullet","current":"original text","suggested":"improved text","why":"reason"}],"keywords_to_add":["kw1","kw2","kw3"],"keywords_already_present":["kw1","kw2"],"keyword_prominence":[{"keyword":"kubernetes","count":6,"prominence":"high"}]}\nrecommended_resume must be exactly one of: Resume_Backend OR Resume_Platform OR Resume_Java OR Resume_AI OR Resume_CSharp OR Resume_General. Choose based on: Resume_Backend for distributed systems/backend roles; Resume_Platform for platform/infra/DevOps roles; Resume_Java for Java/Spring-focused roles; Resume_AI for AI/ML/LLM roles; Resume_CSharp for C#/.Net/Azure roles; Resume_General for broad/mixed/full-stack roles that span AI, backend, and Java. Max 3 changes. Max 5 keywords each. For keyword_prominence: list the up to 8 most repeated and prominent hard-skill/technology keywords for THIS role, ranked most prominent first, each with its approximate count in the job description and a prominence of "high", "medium", or "low" (weigh title and requirements higher).`
       );
       renderResume(text);
     } else if (section === 'answers') {
